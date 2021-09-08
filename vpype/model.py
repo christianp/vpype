@@ -445,6 +445,8 @@ class Document:
         """
         self._layers: Dict[int, LineCollection] = {}
         self._page_size: Optional[Tuple[float, float]] = page_size
+        self._stroke_layers: Dict[str, int] = {}
+        self._layer_strokes: Dict[int, str] = {}
 
         if line_collection:
             self.add(line_collection, 1)
@@ -535,6 +537,16 @@ class Document:
         else:
             self._layers[layer_id] = LineCollection(value)
 
+    def stroke_layer_id(self,stroke):
+        if stroke not in self._stroke_layers:
+            layer_id = self.free_id()
+            self._stroke_layers[stroke] = layer_id
+            self._layer_strokes[layer_id] = stroke
+        return self._stroke_layers[stroke]
+
+    def layer_id_stroke(self,layer_id):
+        return self._layer_strokes[layer_id]
+
     def free_id(self) -> int:
         """Returns the lowest unused layer id.
 
@@ -546,7 +558,7 @@ class Document:
             vid += 1
         return vid
 
-    def add(self, lc: LineCollection, layer_id: Union[None, int] = None) -> None:
+    def add(self, lc: LineCollection, layer_id: Union[None, int] = None, stroke: Union[None, str] = None) -> None:
         """Add a the content of a :py:class:`LineCollection` to a given layer.
 
         If the given layer is None, the input LineCollection is used to create a new layer
@@ -557,10 +569,18 @@ class Document:
             while layer_id in self._layers:
                 layer_id += 1
 
+        if stroke is not None:
+            self._stroke_layers[stroke] = layer_id
+            self._layer_strokes[layer_id] = stroke
+
         if layer_id in self._layers:
             self._layers[layer_id].extend(lc)
         else:
             self._layers[layer_id] = lc
+
+    def add_stroke(self, lc: LineCollection, stroke: str) -> None:
+        lid = self.stroke_layer_id(stroke)
+        self.add(lc,lid)
 
     def extend(self, doc: "Document") -> None:
         """Extend a Document with the content of another Document.
@@ -578,7 +598,7 @@ class Document:
         self.extend_page_size(doc.page_size)
 
         for layer_id, layer in doc.layers.items():
-            self.add(layer, layer_id)
+            self.add(layer, layer_id, doc.layer_id_stroke(layer_id))
 
     def is_empty(self) -> bool:
         """Returns True if all layers are empty.

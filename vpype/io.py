@@ -1,5 +1,6 @@
 """File import/export functions.
 """
+from collections import defaultdict
 import copy
 import datetime
 import math
@@ -12,7 +13,7 @@ import numpy as np
 import svgelements
 import svgwrite
 from multiprocess import Pool
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Polygon, MultiPolygon, MultiLineString
 from svgwrite.extensions import Inkscape
 
 from .config import CONFIG_MANAGER, PaperConfig, PlotterConfig
@@ -87,7 +88,7 @@ _PathListType = List[
 
 
 def _convert_flattened_paths(
-    paths: _PathListType, quantization: float, simplify: bool, parallel: bool
+    paths: _PathListType, quantization: float, simplify: bool, parallel: bool, path_filter=None
 ) -> "LineCollection":
     """Convert a list of FlattenedPaths to a :class:`LineCollection`.
 
@@ -137,7 +138,7 @@ def _convert_flattened_paths(
                 step = max(2, int(math.ceil(seg.length() / quantization)))
                 line = seg.npoint(np.linspace(0, 1, step))
 
-                if simplify:
+                if simplify and len(line)>=2:
                     line = np.array(LineString(line).simplify(tolerance=quantization))
 
                 line = line.view(dtype=complex).reshape(len(line))
@@ -150,6 +151,9 @@ def _convert_flattened_paths(
         if len(point_stack) > 0:
             result.append(point_stack.get())
 
+        if path_filter is not None:
+            result = path_filter(result, path)
+
         return result
 
     # benchmarking indicated that parallel processing only makes sense if simplify is used
@@ -159,10 +163,34 @@ def _convert_flattened_paths(
     else:
         results = map(_process_path, paths)
 
-    lc = LineCollection()
-    for res in results:
-        lc.extend(res)
-    return lc
+
+    lcs = defaultdict(lambda: LineCollection())
+    filled_shape = Polygon()
+    for res,path in reversed(list(zip(results,paths))):
+        if not isinstance(path,svgelements.SVGElement):
+            bits = path
+            for q in bits:
+                if isinstance(q,svgelements.SVGElement):
+                    path = q
+                    break
+        filled = False
+        if getattr(path,'fill',None) == '#ffffff':
+            filled = True
+        stroke_width = None
+        stroke = getattr(path,'stroke','None')
+        if stroke == '#ffffff':
+            stroke_width = path.stroke_width
+
+        linestrings = [LineString([(x.real,x.imag) for x in seg]) for seg in res if len(seg)>=2]
+        mls = MultiLineString(linestrings)
+        if stroke_width is not None:
+            filled_shape = filled_shape.union(mls.buffer(stroke_width/2))
+        else:
+            lcs[str(stroke)].extend(mls.difference(filled_shape))
+        if filled:
+            filled_shape = filled_shape.union(MultiPolygon(Polygon(ls) for ls in linestrings))
+
+    return lcs
 
 
 def _extract_paths(group: svgelements.Group, recursive) -> _PathListType:
@@ -233,12 +261,13 @@ def read_svg(
     # default width is for SVG with % width/height
     svg = svgelements.SVG.parse(filename, width=default_width, height=default_height)
     paths = _extract_paths(svg, recursive=True)
-    lc = _convert_flattened_paths(paths, quantization, simplify, parallel)
+    lcs = _convert_flattened_paths(paths, quantization, simplify, parallel)
 
     if crop:
-        lc.crop(0, 0, svg.width, svg.height)
+        for lc in lcs.values():
+            lc.crop(0, 0, svg.width, svg.height)
 
-    return lc, svg.width, svg.height
+    return lcs, svg.width, svg.height
 
 
 def read_multilayer_svg(
@@ -249,6 +278,7 @@ def read_multilayer_svg(
     parallel: bool = False,
     default_width: float = _DEFAULT_WIDTH,
     default_height: float = _DEFAULT_HEIGHT,
+    path_filter = None
 ) -> "Document":
     """Read a multilayer SVG file and return its content as a :class:`Document` instance
     retaining the SVG's layer structure and its dimension.
@@ -286,11 +316,14 @@ def read_multilayer_svg(
     document = Document()
 
     # non-group top level elements are loaded in layer 1
-    lc = _convert_flattened_paths(
-        _extract_paths(svg, recursive=False), quantization, simplify, parallel
+    lcs = _convert_flattened_paths(
+        _extract_paths(svg, recursive=False), quantization, simplify, parallel,
+        path_filter
     )
-    if not lc.is_empty():
-        document.add(lc, 1)
+
+    for stroke,lc in lcs.items():
+        if not lc.is_empty():
+            document.add_stroke(lc,stroke)
 
     def _find_groups(group: svgelements.Group) -> Iterator[svgelements.Group]:
         for elem in group:
@@ -313,11 +346,13 @@ def read_multilayer_svg(
         else:
             lid = i + 1
 
-        lc = _convert_flattened_paths(
-            _extract_paths(g, recursive=True), quantization, simplify, parallel
+        lcs = _convert_flattened_paths(
+            _extract_paths(g, recursive=True), quantization, simplify, parallel,
+            path_filter
         )
-        if not lc.is_empty():
-            document.add(lc, lid)
+        for stroke,lc in lcs.items():
+            if not lc.is_empty():
+                document.add_stroke(lc,stroke)
 
     document.page_size = (svg.width, svg.height)
 
@@ -435,6 +470,10 @@ def write_svg(
 
         dwg.add(group)
 
+    layer_strokes = {}
+    for stroke,lid in corrected_doc._stroke_layers.items():
+        layer_strokes[lid] = stroke
+
     for layer_id in sorted(corrected_doc.layers.keys()):
         layer = corrected_doc.layers[layer_id]
 
@@ -444,7 +483,7 @@ def write_svg(
             group.attribs["stroke"] = _COLORS[color_idx % len(_COLORS)]
             color_idx += 1
         else:
-            group.attribs["stroke"] = "black"
+            group.attribs["stroke"] = layer_strokes.get(layer_id,'black')
         group.attribs["style"] = "display:inline"
         group.attribs["id"] = f"layer{layer_id}"
 

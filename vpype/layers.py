@@ -103,6 +103,9 @@ class LayerType(click.ParamType):
         if value is None:
             return None
 
+        if value==-2:
+            value = 'all'
+
         if value.lower() == "all":
             if self.accept_multiple:
                 return LayerType.ALL
